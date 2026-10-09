@@ -172,3 +172,25 @@ for each c:
 panoptic = encode_coco_panoptic(semantic_map, instance_map)
 write png + json segment info (incl. iscrowd=1 for flagged/unresolvable regions)
 write qa_report; route flagged frames to review tool
+
+
+Two different things are going wrong, and the picture tells me which path each instance took.
+
+The person is fine; the containers never went through OneFormer. The person silhouette is a clean model mask. The containers have horizontal/vertical scanline striping and holes, which is what you get when projected lidar points are being rasterized (dilated) directly into a mask. So almost certainly: candidate_segments() returned nothing for every container, and your rescue path is drawing the lidar points instead of using them as prompts. The far-right container is a perfect rectangle, which looks like the box fallback that we said should never exist, probably because it had too few lidar hits.
+
+The root cause is the class gate. OneFormer’s vocabularies (COCO, ADE20K, Cityscapes) have no “shipping container.” It’ll label those as truck, building, wall, box, or, worst case, fold them into one big building/wall stuff segment together with the real building behind them. Any of those fails your s.is_thing and s.class in class_map["container"] test, so every container falls through.
+
+What I’d change
+
+Log status per instance and look at the histogram first. You’ll see all containers as NO_SEGMENT. Cheap confirmation before touching anything else.
+Make the candidate test class-agnostic for classes OneFormer doesn’t know. For container, consider every segment (thing or stuff) and let containment, coverage and lidar agreement decide. If OneFormer gave each container its own truck/box segment, this alone fixes most of them. If it merged them into one wall segment with containment < 0.5, that segment is correctly rejected and you need step 3.
+Fix the rescue path: lidar points are prompts, not pixels. Never rasterize them. Two good options, and for this scene I’d do both:
+SAM 2 with lidar prompts, and negatives from the neighbours. Positives: 8–10 spatially spread points on the container face from inside its cuboid. Negatives: points from the adjacent containers’ cuboids and from the person’s cuboid. SAM 2 is very good at rigid boxy objects when told where the neighbours are; the earlier disappointment was the box prompt.
+Depth gating for the leftover ambiguity. Interpolate a dense depth inside the 2D box from the lidar hits (nearest-neighbour or Delaunay is fine on a flat container face), then keep only pixels whose depth is within ±1 m of the container’s median depth. This removes the ground strip below the container, the sky above it, and anything nearer, including the person.
+Use the 3D cuboid itself for the containers, if you have it. This is the big one. A container is a cuboid, so the projected visible faces of the 3D box (the polygon, not the tight 2D rectangle) are very close to the true outline already. Rasterize that polygon, subtract every nearer instance by depth, then snap the edges to image gradients with a few GrabCut iterations or a SAM 2 pass seeded from inside it. For people, vehicles and other non-boxy things the cuboid is just a selector, as before. If your annotations are only 2D rectangles, say so and I’ll adapt step 3 to compensate.
+The person/container overlap is a painting-order problem. The person mask should win every contested pixel because it’s ~3 m away versus ~15 m. Make sure step 6 of the pseudocode (paint by depth, far first) runs after the rescue masks are produced, not before. Right now it looks like the containers were painted as full boxes and the person was then stamped on top, so where the person’s silhouette is slightly wrong you see container colour bleed. With depth-gated container masks the container simply has no pixels where the person stands, and the seam disappears.
+Drop the box fallback entirely. For the far-right container with few lidar hits: use the 3D cuboid projection if available, else SAM 2 with whatever points you have, else flag. A rectangle is never an answer.
+
+One more thing visible in the second image: the person’s box is enormous relative to the person. Your 5% box expansion is fine, but you should also check containment against the cuboid’s lidar footprint, not only the box, so an oversized box doesn’t let a background segment (the lamp post, the building edge) sneak in as a candidate.
+
+If you share one frame with its cuboid JSON (I want to see whether it’s 3D corners or 2D rects), the point cloud and the calib, I’ll write the container branch properly: cuboid-face projection → depth gating → SAM 2 edge refinement → depth-ordered painting, and we can look at the result on this exact scene.
