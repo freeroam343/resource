@@ -194,3 +194,47 @@ Drop the box fallback entirely. For the far-right container with few lidar hits:
 One more thing visible in the second image: the person’s box is enormous relative to the person. Your 5% box expansion is fine, but you should also check containment against the cuboid’s lidar footprint, not only the box, so an oversized box doesn’t let a background segment (the lamp post, the building edge) sneak in as a candidate.
 
 If you share one frame with its cuboid JSON (I want to see whether it’s 3D corners or 2D rects), the point cloud and the calib, I’ll write the container branch properly: cuboid-face projection → depth gating → SAM 2 edge refinement → depth-ordered painting, and we can look at the result on this exact scene.
+
+
+SAM “everything” mode (automatic mask generator) at 2–3 granularities, dense point grid. This gives hundreds of edge-aligned proposals per image including whole containers, container faces, doors, the person, the vest, etc.
+OneFormer’s segments, added to the same pool (they’re good for person/vehicle classes).
+Optionally Grounding DINO with the text prompt “shipping container” → tight boxes → SAM. The reason SAM failed for you is that the customer boxes are loose; Grounding DINO boxes are tight, so SAM behaves.
+
+Assembly per cuboid
+
+pool = all candidate masks, each with: pixels, area, mean lidar depth under it (if any), n_lidar
+for each cuboid c:
+    # 1. filter pool to plausible pieces
+    P = masks m in pool where
+          containment(m, c.box2d) > 0.8          # piece lives inside this box
+          and (n_lidar(m)==0 or |depth(m) - c.depth| < 1.0 m)   # right depth layer
+          and not mostly_claimed_by_nearer_instance(m)
+
+    # 2. greedy set cover driven by lidar
+    target = c.pts_uv                             # the object's lidar footprint
+    chosen = []
+    repeat:
+        best = argmax_{m in P} ( lidar_hits(m, target not yet covered) / sqrt(area(m)) )
+        stop if best covers < 3 new lidar points
+        chosen.append(best); remove from P
+    mask = union(chosen)
+
+    # 3. prefer one big piece over many small ones when they agree
+    if exists single m in pool with IoU(m, mask) > 0.85: mask = m
+
+    # 4. image-edge tidy-up only, no geometry: fill holes < 1% area, remove islands with 0 lidar
+
+This fixes all three symptoms directly: sparsity (pool masks are dense), occluder leakage (depth filter + nearer-instance exclusion), and bad boundaries (every pixel came from an image model). Adjacent containers separate because each one’s lidar footprint drives its own set cover, and a pool mask that straddles two containers has a bimodal depth and gets rejected by the depth gate.
+
+The honest second half
+
+Zero-shot will get you to “good on most, flagged on some.” If this dataset matters, the robust answer is to add container to a segmentation model’s vocabulary:
+
+Run the pool-assembly pipeline, keep only instances with high QA scores (lidar_in_mask > 0.85, low depth spread, single-piece agreement).
+Hand-correct ~100–200 of those in CVAT with SAM-assisted brushing. A few hours.
+Fine-tune Mask2Former/OneFormer (or even YOLO-seg since you already have YOLO infrastructure) with container as a thing class.
+Re-run the pipeline with that model in the pool. The image-derived constraint is now a model that actually knows what a container is, and the geometry just does matching and depth ordering, which is what it’s good at.
+
+Loop 1–4 once or twice and the pseudo-labels converge. That’s how most industrial panoptic datasets with custom classes get made from box annotations; nobody gets there with zero-shot alone.
+
+If you send a frame plus the point cloud and calibration, I’ll implement the pool + set-cover assembly on it so you can see whether it’s good enough to skip the fine-tune or just good enough to bootstrap it.
